@@ -201,6 +201,7 @@ class LlavaMetaForCausalLM(ABC):
         all_videos_or_images_features = []
         all_faster_video_features = []
         cur_mm_spatial_pool_stride = self.config.mm_spatial_pool_stride
+        two_cur_mm_spatial_pool_stride = cur_mm_spatial_pool_stride * 2
 
         for idx, feat in enumerate(per_videos_or_images_features):
             
@@ -210,8 +211,7 @@ class LlavaMetaForCausalLM(ABC):
             if idx in video_idx_in_batch and cur_mm_spatial_pool_stride > 1:
                 slower_img_feat = self.get_2dPool(feat,cur_mm_spatial_pool_stride)
                 if self.config.add_faster_video:
-                    cur_mm_spatial_pool_stride = cur_mm_spatial_pool_stride * 2
-                    faster_video_feature = self.get_2dPool(feat,cur_mm_spatial_pool_stride)
+                    faster_video_feature = self.get_2dPool(feat,two_cur_mm_spatial_pool_stride)
             if slower_img_feat is not 0:
                 all_videos_or_images_features.append(slower_img_feat)
             else:
@@ -277,17 +277,17 @@ class LlavaMetaForCausalLM(ABC):
             concat_images = torch.cat([image for image in images_list], dim=0)
             split_sizes = [image.shape[0] for image in images_list]
             encoded_image_features = self.encode_images(concat_images)
-            # image_features,all_faster_video_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
+            image_features,all_faster_video_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
 
             # This is a list, each element is [num_images, patch * patch, dim]
             # rank_print(f"Concat images : {concat_images.shape}")
-            encoded_image_features = torch.split(encoded_image_features, split_sizes)
-            image_features = []
-            for idx, image_feat in enumerate(encoded_image_features):
-                if idx in video_idx_in_batch:
-                    image_features.append(self.get_2dPool(image_feat))
-                else:
-                    image_features.append(image_feat)
+            # encoded_image_features = torch.split(encoded_image_features, split_sizes)
+            # image_features = []
+            # for idx, image_feat in enumerate(encoded_image_features):
+            #     if idx in video_idx_in_batch:
+            #         image_features.append(self.get_2dPool(image_feat))
+            #     else:
+            #         image_features.append(image_feat)
             # image_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
             # rank_print(f"Encoded image feats : {[x.shape for x in image_features]}")
             # image_features = torch.split(image_features, split_sizes, dim=0)
@@ -319,9 +319,11 @@ class LlavaMetaForCausalLM(ABC):
                                 # import pdb; pdb.set_trace()
                                 for _ in range(image_feature.shape[0]):
                                     if _ % self.config.faster_token_stride == 0:
-                                        concat_slow_fater_token.append(torch.cat((image_feature[_], self.model.faster_token[None].to(image_feature.device)), dim=0))
+                                        # concat_slow_fater_token.append(torch.cat((image_feature[_], self.model.faster_token[None].to(image_feature.device)), dim=0))
+                                        concat_slow_fater_token.append(image_feature[_])
                                     else:
-                                        concat_slow_fater_token.append(torch.cat((faster_video_feature[_], self.model.faster_token[None].to(image_feature.device)), dim=0))
+                                        # concat_slow_fater_token.append(torch.cat((faster_video_feature[_], self.model.faster_token[None].to(image_feature.device)), dim=0))
+                                        concat_slow_fater_token.append(faster_video_feature[_])
                                 # import pdb; pdb.set_trace()
                                 image_feature = torch.cat(concat_slow_fater_token)
 

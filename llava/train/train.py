@@ -1153,58 +1153,68 @@ class LazySupervisedDataset(Dataset):
         elif "video" in sources[0]:
             video_file = self.list_data_dict[i]["video"]
             video_folder = self.data_args.video_folder
-            video_file = os.path.join(video_folder, video_file)
-            suffix = video_file.split(".")[-1]
-            if not os.path.exists(video_file):
-                print("File {} not exist!".format(video_file))
-
-            try:
-                if "shareVideoGPTV" in video_file:
-                    frame_files = [os.path.join(video_file, f) for f in os.listdir(video_file) if os.path.isfile(os.path.join(video_file, f))]
-                    frame_files.sort()  # Ensure the frames are sorted if they are named sequentially
-
-                    # TODO: Hard CODE: Determine the indices for uniformly sampling 10 frames
-                    if self.data_args.force_sample:
-                        num_frames_to_sample = self.data_args.frames_upbound
-                    else:
-                        num_frames_to_sample = 10
-
-                    avg_fps = 2
-                    
-                    total_frames = len(frame_files)
-                    sampled_indices = np.linspace(0, total_frames - 1, num_frames_to_sample, dtype=int)
-
-
-                    frame_time = [i/2 for i in sampled_indices]
-                    frame_time = ",".join([f"{i:.2f}s" for i in frame_time])
-
-                    video_time = total_frames / avg_fps
-
-                    # Read and store the sampled frames
-                    video = []
-                    for idx in sampled_indices:
-                        frame_path = frame_files[idx]
-                        try:
-                            with Image.open(frame_path) as img:
-                                frame = img.convert("RGB")
-                                video.append(frame)
-                        except IOError:
-                            print(f"Failed to read frame at path: {frame_path}")
-                else:
+            if type(sources[0]['video']) is list:
+                video_files = [os.path.join(video_folder, x) for x in video_file]
+                images = []
+                for video_file in video_files:
                     video, video_time, frame_time, num_frames_to_sample = process_video_with_decord(video_file, self.data_args)
 
-                processor = self.data_args.image_processor
-                image = processor.preprocess(video, return_tensors="pt")["pixel_values"]
-                if self.data_args.add_time_instruction:
-                    time_instruciton = f"The video lasts for {video_time:.2f} seconds, and {num_frames_to_sample} frames are uniformly sampled from it. These frames are located at {frame_time}.Please answer the following questions related to this video."
-                    sources[0]["conversations"][0]["value"] = f'{DEFAULT_IMAGE_TOKEN}\n{time_instruciton}\n{sources[0]["conversations"][0]["value"].replace(DEFAULT_IMAGE_TOKEN, "")}'
-                image = [(image, video[0].size, "video")]
-                sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
-                # print(sources)
-            except Exception as e:
-                print(f"Error: {e}")
-                print(f"Failed to read video file: {video_file}")
-                return self._get_item(i + 1)
+                    processor = self.data_args.image_processor
+                    image = processor.preprocess(video, return_tensors="pt")["pixel_values"]
+                    images.append((image, video[0].size, "video"))
+                image = images
+            else:
+                video_file = os.path.join(video_folder, video_file)
+                suffix = video_file.split(".")[-1]
+                if not os.path.exists(video_file):
+                    print("File {} not exist!".format(video_file))
+
+                try:
+                    if "shareVideoGPTV" in video_file:
+                        frame_files = [os.path.join(video_file, f) for f in os.listdir(video_file) if os.path.isfile(os.path.join(video_file, f))]
+                        frame_files.sort()  # Ensure the frames are sorted if they are named sequentially
+
+                        # TODO: Hard CODE: Determine the indices for uniformly sampling 10 frames
+                        if self.data_args.force_sample:
+                            num_frames_to_sample = self.data_args.frames_upbound
+                        else:
+                            num_frames_to_sample = 10
+
+                        avg_fps = 2
+                        
+                        total_frames = len(frame_files)
+                        sampled_indices = np.linspace(0, total_frames - 1, num_frames_to_sample, dtype=int)
+
+
+                        frame_time = [i/2 for i in sampled_indices]
+                        frame_time = ",".join([f"{i:.2f}s" for i in frame_time])
+
+                        video_time = total_frames / avg_fps
+
+                        # Read and store the sampled frames
+                        video = []
+                        for idx in sampled_indices:
+                            frame_path = frame_files[idx]
+                            try:
+                                with Image.open(frame_path) as img:
+                                    frame = img.convert("RGB")
+                                    video.append(frame)
+                            except IOError:
+                                print(f"Failed to read frame at path: {frame_path}")
+                    else:
+                        video, video_time, frame_time, num_frames_to_sample = process_video_with_decord(video_file, self.data_args)
+
+                    processor = self.data_args.image_processor
+                    image = processor.preprocess(video, return_tensors="pt")["pixel_values"]
+                    if self.data_args.add_time_instruction:
+                        time_instruciton = f"The video lasts for {video_time:.2f} seconds, and {num_frames_to_sample} frames are uniformly sampled from it. These frames are located at {frame_time}.Please answer the following questions related to this video."
+                        sources[0]["conversations"][0]["value"] = f'{DEFAULT_IMAGE_TOKEN}\n{time_instruciton}\n{sources[0]["conversations"][0]["value"].replace(DEFAULT_IMAGE_TOKEN, "")}'
+                    image = [(image, video[0].size, "video")]
+                except Exception as e:
+                    print(f"Error: {e}")
+                    print(f"Failed to read video file: {video_file}")
+                    return self._get_item(i + 1)
+            sources = preprocess_multimodal(copy.deepcopy([e["conversations"] for e in sources]), self.data_args)
         else:
             sources = copy.deepcopy([e["conversations"] for e in sources])
 
@@ -1609,7 +1619,9 @@ def train(attn_implementation=None):
         model.config.mm_spatial_pool_stride = model_args.mm_spatial_pool_stride 
 
         ### Deciding train which part of the model
-        if model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
+        if training_args.lora_enable:
+            pass
+        elif model_args.mm_tunable_parts is None:  # traditional way of deciding which part to train
             model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
             model.config.tune_mm_vision_resampler = training_args.tune_mm_vision_resampler = model_args.tune_mm_vision_resampler
             if model_args.tune_mm_mlp_adapter or model_args.tune_mm_vision_resampler:
