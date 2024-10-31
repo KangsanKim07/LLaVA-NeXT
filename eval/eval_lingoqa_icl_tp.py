@@ -19,6 +19,7 @@ import concurrent.futures
 from tqdm import tqdm
 import os
 import torch.nn.functional as F
+from llava.confidence.llava_with_confidence import LLavaWithConfidence
 
 def load_frames(image_paths):
     images = [np.array(Image.open(x)) for x in image_paths]
@@ -46,7 +47,7 @@ def put_examples(conv, examples):
         videos = list(executor.map(lambda p: load_and_preprocess_video(p, max_frames_num), video_paths))
     return conv, videos
 
-# model_path = "/home/ubuntu/workspace/LLaVA-NeXT/checkpoints/finetuned/llava-video_icl-f32nosf2shot/checkpoint-1200"
+# model_path = "/home/ubuntu/workspace/LLaVA-NeXT/checkpoints/finetuned/llava-video_icl/checkpoint-300"
 # model_base = "checkpoints/LLaVA-Video-7B-Qwen2"
 # model_name = "lora_llava_qwen"
 model_path = "checkpoints/LLaVA-Video-7B-Qwen2"
@@ -56,6 +57,8 @@ device = "cuda"
 device_map = "auto"
 tokenizer, model, image_processor, max_length = load_pretrained_model(model_path, model_base, model_name, torch_dtype="bfloat16", device_map=device_map)  # Add any other thing you want to pass in llava_model_args
 model.eval()
+confidence_model = LLavaWithConfidence(model)
+
 judge_name = 'wayveai/Lingo-Judge'
 pipe = pipeline("text-classification", model=judge_name)
 df = pd.read_json("/home/ubuntu/workspace/datasets/LingoQA/test_examples.jsonl", lines=True)
@@ -79,8 +82,8 @@ for _, data in df.iterrows():
     max_text_outputs = None
     max_confi = 0
     for num in range(4):
-        example_ids = train_examples[:4]
-        train_examples = train_examples[4:]
+        example_ids = train_examples[:2]
+        train_examples = train_examples[2:]
         examples = train_df[train_df['question_id'].isin(example_ids)]
         conv_template = "qwen_1_5"  # Make sure you use correct chat template for different models
         question = DEFAULT_IMAGE_TOKEN + f"\n{data['question']}"
@@ -91,45 +94,34 @@ for _, data in df.iterrows():
         prompt_question = conv.get_prompt()
         input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device)
         videos.append(video)
-        cont = model.generate(
+        cont, confidence = confidence_model.generate(
             input_ids,
             images=videos,
             modalities=["video"]*len(videos),
             do_sample=False,
             temperature=0,
-            max_new_tokens=100,
-            output_scores=True,
-            return_dict_in_generate=True
+            max_new_tokens=100
         )
-        generated_tokens = cont.sequences
-        text_outputs = tokenizer.decode(generated_tokens[0], skip_special_tokens=True).strip()
-        scores = cont.scores 
-        generated_token_probs = []
-        for i, score in enumerate(scores):
-            token_id = generated_tokens[0][i]  # ignoring input tokens
-            probs = F.softmax(score, dim=-1)
-            token_prob = probs[0, token_id].item()  # probs[0] corresponds to the batch
-            generated_token_probs.append(token_prob)
-        prob = min(generated_token_probs) #sum(generated_token_probs) / len(generated_token_probs)
-        if prob > 0.5:
+        text_outputs = tokenizer.decode(cont.sequences[0], skip_special_tokens=True).strip()
+        if confidence > 0.8:
             max_text_outputs = text_outputs
-            max_confi = prob
+            max_confi = confidence
             break
         else:
-            if prob > max_confi:
+            if confidence > max_confi:
                 max_text_outputs = text_outputs
-                max_confi = prob
+                max_confi = confidence
     answer = data['answer']    
     input = f"[CLS]\nQuestion: {data['question']}\nAnswer: {answer}\nStudent: {max_text_outputs}"
     result = pipe(input)
     score = result[0]['score']
-    if score > 0.5:
+    if score > 0.8:
         acc.append(1)
         correct.append(max_confi)
     else:
         acc.append(0)
         wrong.append(max_confi)
-    print(round(sum(acc)/len(acc), 5), [False, True][acc[-1]], round(max_confi, 3), num, 'shot', len(videos)-1, model_name)
+    print(round(sum(acc)/len(acc), 5), [False, True][acc[-1]], round(max_confi, 3), 'trial', num, 'shot', len(videos)-1, model_name)
     # print('correct prob', sum(correct)/(len(correct)+1e-5))
     # print('wrong prob', sum(wrong)/(len(wrong)+1e-5))
     pbar.update(1)

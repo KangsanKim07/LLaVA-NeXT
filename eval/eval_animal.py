@@ -12,6 +12,8 @@ import warnings
 from decord import VideoReader, cpu
 import numpy as np
 warnings.filterwarnings("ignore")
+import pandas as pd
+from tqdm import tqdm
 
 def load_video(video_path, max_frames_num,fps=1,force_sample=False):
     if max_frames_num == 0:
@@ -40,22 +42,23 @@ device_map = "auto"
 tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, torch_dtype="bfloat16", device_map=device_map)  # Add any other thing you want to pass in llava_model_args
 model.eval()
 
-with open('/home/ubuntu/workspace/datasets/SportsQA/meta-data/test_finegym.json', 'r') as f:
-    jf = json.load(f)
+with open("/home/ubuntu/workspace/datasets/AnimalKingdom/annotation/val_mc.json", "r") as f:
+    df = json.load(f)
 
 score = []
-for data in jf:
+pbar = tqdm(total=len(df))
+for data in df:
     video_path = "/home/ubuntu/workspace/datasets/" + data['video']
-    max_frames_num = 64
+    max_frames_num = 32
     video,frame_time,video_time = load_video(video_path, max_frames_num, 1, force_sample=False)
     video = image_processor.preprocess(video, return_tensors="pt")["pixel_values"].cuda().bfloat16()
     video = [video]
     conv_template = "qwen_1_5"  # Make sure you use correct chat template for different models
-    question = DEFAULT_IMAGE_TOKEN + f"\n{data['question']} Answer in short words or a sentence."
+    question =  DEFAULT_IMAGE_TOKEN + "\n" + data['question']
     conv = copy.deepcopy(conv_templates[conv_template])
     conv.append_message(conv.roles[0], question)
     conv.append_message(conv.roles[1], None)
-    prompt_question = conv.get_prompt()
+    prompt_question = conv.get_prompt() + "The answer is ("
     input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device)
     cont = model.generate(
         input_ids,
@@ -63,15 +66,20 @@ for data in jf:
         modalities= ["video"],
         do_sample=False,
         temperature=0,
-        max_new_tokens=4096,
+        max_new_tokens=3,
     )
     text_outputs = tokenizer.batch_decode(cont, skip_special_tokens=True)[0].strip()
-    answer = data['answer'].lower()
-    print(text_outputs, '///', answer)
+    answer = data['answer']
 
-    if answer in text_outputs:
+    print(text_outputs, '####', answer)
+    if text_outputs != "" and answer == text_outputs[0]:
         score.append(1)
     else:
         score.append(0)
     
     print(sum(score)/len(score))
+    pbar.update(1)
+    del cont, input_ids, text_outputs
+    torch.cuda.empty_cache()
+
+pbar.close()
