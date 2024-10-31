@@ -15,6 +15,7 @@ warnings.filterwarnings("ignore")
 from tqdm import tqdm
 import pandas as pd
 import torch.nn.functional as F
+import time
 
 pretrained = "checkpoints/LLaVA-Video-7B-Qwen2"
 model_name = "llava_qwen"
@@ -41,7 +42,10 @@ acc = []
 pbar = tqdm(total=len(jf))
 current_video_path = None
 current_video = None
-for data in jf:
+shot = 4
+num_frames = 16
+test_frames = 32
+for q, data in enumerate(jf):
     video_path = f"/home/ubuntu/workspace/datasets/driveandact/kinect_ir/{data['file_id']}.mp4"
     if current_video_path != video_path:
         current_video = VideoReader(video_path, ctx=cpu(0),num_threads=1)
@@ -50,6 +54,9 @@ for data in jf:
     
     frame_start, frame_end = data['frame_start'], data['frame_end']
     frame_idx = [i for i in range(frame_start, frame_end, fps)]
+    if len(frame_idx) > test_frames:
+        sampled_indices = np.linspace(0, len(frame_idx) - 1, test_frames, dtype=int)
+        frame_idx = [frame_idx[i] for i in sampled_indices]
     spare_frames = current_video.get_batch(frame_idx).asnumpy()
     video = image_processor.preprocess(spare_frames, return_tensors="pt")["pixel_values"].cuda().bfloat16()
     
@@ -61,9 +68,9 @@ for data in jf:
     max_text_outputs = None
     max_confi = 0
     for num in range(4):
-        example_ids = candidates[:2]
+        example_ids = candidates[:shot]
         examples = [train_data[x] for x in example_ids]
-        candidates = candidates[2:]
+        candidates = candidates[shot:]
         conv = copy.deepcopy(conv_templates[conv_template])
         videos = []
         for ex in examples:
@@ -73,9 +80,13 @@ for data in jf:
             ex_video = VideoReader(video_path, ctx=cpu(0),num_threads=1)
             ex_frame_start, ex_frame_end = data['frame_start'], data['frame_end']
             ex_frame_idx = [i for i in range(ex_frame_start, ex_frame_end, fps)]
+            if len(ex_frame_idx) > num_frames:
+                sampled_indices = np.linspace(0, len(ex_frame_idx) - 1, num_frames, dtype=int)
+                ex_frame_idx = [ex_frame_idx[i] for i in sampled_indices]
             ex_spare_frames = ex_video.get_batch(ex_frame_idx).asnumpy()
             ex_video_tensors = image_processor.preprocess(ex_spare_frames, return_tensors="pt")["pixel_values"].cuda().bfloat16()
             videos.append(ex_video_tensors)
+            del ex_video
 
         conv.append_message(conv.roles[0], question)
         conv.append_message(conv.roles[1], None)
@@ -118,7 +129,7 @@ for data in jf:
     else:
         acc.append(0)
     
-    print('total acc', round(sum(acc)/len(acc), 5), ['Wrong', 'Correct'][acc[-1]], round(max_confi, 3), 'try', num, 'shot', len(videos)-1, 'sportsqa')
+    print('total acc', round(sum(acc)/len(acc), 5), ['Wrong', 'Correct'][acc[-1]], round(max_confi, 3), 'try', num, 'shot', shot, 'driveact part', part)
     pbar.update(1)
 
     del cont, probs, generated_tokens, scores

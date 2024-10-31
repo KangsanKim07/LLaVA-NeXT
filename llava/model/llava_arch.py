@@ -84,7 +84,8 @@ class LlavaMetaModel:
 
             # In case it is frozen by LoRA
             for p in self.vision_resampler.parameters():
-                p.requires_grad = True
+                if p.dtype != torch.uint8 and p.dtype != torch.int8:
+                    p.requires_grad = True
 
         self.config.use_mm_proj = True
         self.config.mm_projector_type = getattr(model_args, "mm_projector_type", "linear")
@@ -110,7 +111,8 @@ class LlavaMetaModel:
         else:
             # In case it is frozen by LoRA
             for p in self.mm_projector.parameters():
-                p.requires_grad = True
+                if p.dtype != torch.uint8 and p.dtype != torch.int8:
+                    p.requires_grad = True
 
         if pretrain_mm_mlp_adapter is not None:
             mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location="cpu")
@@ -277,17 +279,17 @@ class LlavaMetaForCausalLM(ABC):
             concat_images = torch.cat([image for image in images_list], dim=0)
             split_sizes = [image.shape[0] for image in images_list]
             encoded_image_features = self.encode_images(concat_images)
-            image_features,all_faster_video_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
+            # image_features,all_faster_video_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
 
             # This is a list, each element is [num_images, patch * patch, dim]
             # rank_print(f"Concat images : {concat_images.shape}")
-            # encoded_image_features = torch.split(encoded_image_features, split_sizes)
-            # image_features = []
-            # for idx, image_feat in enumerate(encoded_image_features):
-            #     if idx in video_idx_in_batch:
-            #         image_features.append(self.get_2dPool(image_feat))
-            #     else:
-            #         image_features.append(image_feat)
+            encoded_image_features = torch.split(encoded_image_features, split_sizes)
+            image_features = []
+            for idx, image_feat in enumerate(encoded_image_features):
+                if idx in video_idx_in_batch:
+                    image_features.append(self.get_2dPool(image_feat))
+                else:
+                    image_features.append(image_feat)
             # image_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
             # rank_print(f"Encoded image feats : {[x.shape for x in image_features]}")
             # image_features = torch.split(image_features, split_sizes, dim=0)
