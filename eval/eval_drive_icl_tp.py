@@ -16,6 +16,7 @@ from tqdm import tqdm
 import pandas as pd
 import torch.nn.functional as F
 import time
+from llava.confidence.llava_with_confidence import LLavaWithConfidence
 
 pretrained = "checkpoints/LLaVA-Video-7B-Qwen2"
 model_name = "llava_qwen"
@@ -24,6 +25,7 @@ device_map = "auto"
 
 tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, torch_dtype="bfloat16", device_map=device_map)  # Add any other thing you want to pass in llava_model_args
 model.eval()
+confidence_model = LLavaWithConfidence(model)
 
 part = 2
 with open(f'/home/ubuntu/workspace/datasets/driveandact/midlevel_split{part}_test.json', 'r') as f:
@@ -42,8 +44,8 @@ acc = []
 pbar = tqdm(total=len(jf))
 current_video_path = None
 current_video = None
-shot = 8
-num_frames = 8
+shot = 2
+num_frames = 32
 test_frames = 32
 for q, data in enumerate(jf):
     video_path = f"/home/ubuntu/workspace/datasets/driveandact/kinect_ir/{data['file_id']}.mp4"
@@ -94,32 +96,25 @@ for q, data in enumerate(jf):
         input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device)
 
         with torch.no_grad():
-            cont = model.generate(
+            cont, confidence = confidence_model.generate(
                 input_ids,
                 images=videos,
-                modalities=["video"] * len(videos),
+                modalities=["video"]*len(videos),
                 do_sample=False,
                 temperature=0,
                 max_new_tokens=10,
-                output_scores=True,
-                return_dict_in_generate=True
             )
         del input_ids, videos
         torch.cuda.empty_cache()
-        generated_tokens = cont.sequences
-        text_outputs = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0].strip()
-        scores = cont.scores 
-        scores = torch.concat(list(scores), dim=0)
-        probs = F.softmax(scores, dim=-1)
-        prob = probs.max(dim=-1).values.min().item()
-        if prob > 0.5:
-            max_text_outputs = text_outputs
-            max_confi = prob
+        pred = tokenizer.batch_decode(cont.sequences, skip_special_tokens=True)[0].strip()
+        if confidence > 0.7:
+            max_text_outputs = pred
+            max_confi = confidence
             break
         else:
-            if prob > max_confi:
-                max_confi = prob
-                max_text_outputs = text_outputs
+            if confidence > max_confi:
+                max_confi = confidence
+                max_text_outputs = pred
     answer = data['activity']
 
     print(max_text_outputs, '///', answer)
@@ -132,7 +127,7 @@ for q, data in enumerate(jf):
     print('total acc', round(sum(acc)/len(acc), 5), ['Wrong', 'Correct'][acc[-1]], round(max_confi, 3), 'try', num, 'shot', shot, 'driveact part', part)
     pbar.update(1)
 
-    del cont, probs, generated_tokens, scores
+    del cont, pred
     torch.cuda.empty_cache()
 
 pbar.close()

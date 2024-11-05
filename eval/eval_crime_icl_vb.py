@@ -14,7 +14,9 @@ import numpy as np
 warnings.filterwarnings("ignore")
 from tqdm import tqdm
 import torch.nn.functional as F
-from llava.confidence.llava_with_confidence import LLavaWithConfidence
+import concurrent.futures
+import random
+random.seed(1)
 
 def load_video(video_path, max_frames_num,fps=1,force_sample=False):
     if max_frames_num == 0:
@@ -35,8 +37,15 @@ def load_video(video_path, max_frames_num,fps=1,force_sample=False):
 
     return spare_frames,frame_time,video_time
 
+def load_and_preprocess_video(video_path, max_frames_num):
+    video, frame_time, video_time = load_video(video_path, max_frames_num, 1, force_sample=False)
+    video = image_processor.preprocess(video, return_tensors="pt")["pixel_values"].cuda().bfloat16()
+    return video
+
 def put_examples(conv, examples, question):
     videos = []
+    video_paths = []
+    max_frames_num = 32
     for ex in reversed(examples):
         ex_answer = ex.split('_')[0].split('0')[0]
         if ex_answer == 'Normal':
@@ -50,12 +59,11 @@ def put_examples(conv, examples, question):
         if folder == "Normal":
             folder = "Normal_Videos_event"
         video_path = f"/home/ubuntu/workspace/datasets/UCF_Crimes/videos/{folder}/{ex}"
-        video,frame_time,video_time = load_video(video_path, 32, 1, force_sample=False)
-        video = image_processor.preprocess(video, return_tensors="pt")["pixel_values"].cuda().bfloat16()
-        videos.append(video)
-    
-    return conv, videos
+        video_paths.append(video_path)
 
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        videos = list(executor.map(lambda p: load_and_preprocess_video(p, max_frames_num), video_paths))
+    return conv, videos
 
 model_path = "checkpoints/LLaVA-Video-7B-Qwen2"
 model_base = None
@@ -65,13 +73,16 @@ device_map = "auto"
 
 tokenizer, model, image_processor, max_length = load_pretrained_model(model_path, model_base, model_name, torch_dtype="bfloat16", device_map=device_map)  # Add any other thing you want to pass in llava_model_args
 model.eval()
-confidence_model = LLavaWithConfidence(model)
 
 test_vids = []
 test_subset_id = 4
 with open(f'/home/ubuntu/workspace/datasets/UCF_Crimes/Action_Regnition_splits/test_00{test_subset_id}.txt', 'r') as f:
     test_vids += f.readlines()
 test_vids = [x.replace(' \n', '') for x in test_vids]
+
+with open(f'/home/ubuntu/workspace/datasets/UCF_Crimes/Action_Regnition_splits/train_00{test_subset_id}.txt', 'r') as f:
+    train_vids = f.readlines()
+train_vids = [x.replace(' \n', '').split('/')[-1] for x in train_vids]
 
 with open(f'/home/ubuntu/workspace/datasets/UCF_Crimes/video_top400_sim_subset{test_subset_id}.json') as f:
     jf = json.load(f)
@@ -81,20 +92,21 @@ with open(f'/home/ubuntu/workspace/datasets/UCF_Crimes/video_top400_sim_subset{t
 
 question_sample = "Classify the following video into one of the following categories: Abuse, Arrest, Arson, Assault, Burglary, Explosion, Fighting, Normal Event, Road Accident, Robbery, Shooting, Shoplifting, Stealing, or Vandalism. Just answer the name of the category."
 acc = []
+shot = 2
 for path in tqdm(test_vids):
     video_path = "/home/ubuntu/workspace/datasets/UCF_Crimes/videos/" + path
     max_frames_num = 32
     video,frame_time,video_time = load_video(video_path, max_frames_num, 1, force_sample=False)
     video = image_processor.preprocess(video, return_tensors="pt")["pixel_values"].cuda().bfloat16()
     conv_template = "qwen_1_5"  # Make sure you use correct chat template for different models
-    question = DEFAULT_IMAGE_TOKEN + f"\n{question_sample}"
+    question = DEFAULT_IMAGE_TOKEN + f"\n{question_sample}\nAre you confident enough to give the correct answer to this question? Answer with yes or no."
     max_text_outputs = None
     max_confi = 0
     candidates = sim_rank[path.split('/')[-1]]
-    for num in range(8):
+    for num in range(4):
         conv = copy.deepcopy(conv_templates[conv_template])
-        examples = candidates[:2]
-        candidates = candidates[2:]
+        examples = candidates[:shot]
+        candidates = candidates[shot:]
         conv, videos = put_examples(conv, examples, question_sample)
         videos.append(video)
         conv.append_message(conv.roles[0], question)
@@ -102,34 +114,57 @@ for path in tqdm(test_vids):
         prompt_question = conv.get_prompt()
         input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device)
 
-        cont, confidence = confidence_model.generate(
-            input_ids,
-            images=videos,
-            modalities=["video"]*len(videos),
-            do_sample=False,
-            temperature=0,
-            max_new_tokens=4096,
-        )
-        pred = tokenizer.batch_decode(cont.sequences, skip_special_tokens=True)[0].strip()
-        if confidence > 0.7:
-            max_text_outputs = pred
-            max_confi = confidence
-            break
-        else:
-            if confidence > max_confi:
-                max_text_outputs = pred
-                max_confi = confidence
+        with torch.no_grad():
+            cont = model.generate(
+                input_ids,
+                images=videos,
+                modalities=["video"]*len(videos),
+                do_sample=False,
+                temperature=0,
+                max_new_tokens=4096,
+            )
+        check_text_outputs = tokenizer.batch_decode(cont, skip_special_tokens=True)[0].strip().lower()
+        print(check_text_outputs)
+        del input_ids
+        torch.cuda.empty_cache()
+
+        if check_text_outputs == 'yes' or num == 0:
+            conv.messages = conv.messages[:-2]
+            conv.append_message(conv.roles[0], DEFAULT_IMAGE_TOKEN + f"\n{question_sample}")
+            conv.append_message(conv.roles[1], None)
+
+            prompt_question = conv.get_prompt()
+            input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                cont = model.generate(
+                    input_ids,
+                    images=videos,
+                    modalities=["video"]*len(videos),
+                    do_sample=False,
+                    temperature=0,
+                    max_new_tokens=4096,
+                )
+            text_outputs = tokenizer.batch_decode(cont, skip_special_tokens=True)[0].strip().lower()
+            del input_ids
+            torch.cuda.empty_cache()
+            if check_text_outputs == 'yes':
+                break
+
+    del videos
+    torch.cuda.empty_cache()
+
     answer = path.split('/')[0]
     if answer == 'RoadAccidents':
         answer = 'Road Accident'
     elif answer == 'Normal_Videos_event':
         answer = 'Normal Event'
-    print(max_text_outputs, '///', answer)
+    print(text_outputs, '///', answer.lower())
 
-    if answer.lower() in max_text_outputs.lower():
+    if answer.lower() in text_outputs.lower():
         acc.append(1)
     else:
         acc.append(0)
     
-    print('total acc', round(sum(acc)/len(acc), 5), [False, True][acc[-1]], round(max_confi, 3), 'try', num, 'shot', len(videos)-1)
+    print('total acc', round(sum(acc)/len(acc), 5), [False, True][acc[-1]], 'try', num, 'shot', shot)
     print("subset", test_subset_id)

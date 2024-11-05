@@ -42,7 +42,7 @@ tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained
 model.eval()
 
 test_vids = []
-test_subset_id = 4
+test_subset_id = 2
 with open(f'/home/ubuntu/workspace/datasets/UCF_Crimes/Action_Regnition_splits/test_00{test_subset_id}.txt', 'r') as f:
     test_vids += f.readlines()
 test_vids = [x.replace(' \n', '') for x in test_vids]

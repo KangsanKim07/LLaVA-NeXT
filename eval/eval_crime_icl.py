@@ -108,9 +108,9 @@ for path in tqdm(test_vids):
     candidates = sim_rank[path.split('/')[-1]]
     for num in range(1):
         conv = copy.deepcopy(conv_templates[conv_template])
-        # examples = candidates[:2]
-        # candidates = candidates[2:]
-        examples = random.sample(train_vids, 2)
+        examples = candidates[:2]
+        candidates = candidates[2:]
+        # examples = random.sample(train_vids, 2)
         conv, videos = put_examples(conv, examples, question_sample)
         videos.append(video)
         conv.append_message(conv.roles[0], question)

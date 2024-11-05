@@ -12,8 +12,8 @@ import warnings
 from decord import VideoReader, cpu
 import numpy as np
 warnings.filterwarnings("ignore")
-from llava.confidence.llava_with_confidence import LLavaWithConfidence
 from tqdm import tqdm
+import torch.nn.functional as F
 
 def load_video(video_path, max_frames_num,fps=1,force_sample=False):
     if max_frames_num == 0:
@@ -59,7 +59,6 @@ device_map = "auto"
 
 tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, torch_dtype="bfloat16", device_map=device_map)  # Add any other thing you want to pass in llava_model_args
 model.eval()
-confidence_model = LLavaWithConfidence(model)
 
 test_vids = []
 with open(f'/home/ubuntu/workspace/datasets/CapERA/CapERA_DATASET_test.json', 'r') as f:
@@ -79,6 +78,7 @@ with open(f"/home/ubuntu/workspace/datasets/CapERA/video_top400_sim_subset.json"
 question_sample = "Provide a concise depiction of this video."
 history = []
 max_frames_num = 32
+shot = 8
 for data in tqdm(test_jf):
     ground_truth = data['annotation']['English_caption']
     video_id = data['video_id']
@@ -93,39 +93,51 @@ for data in tqdm(test_jf):
         conv_template = "qwen_1_5"  # Make sure you use correct chat template for different models
         question = DEFAULT_IMAGE_TOKEN + f"\n{question_sample}"
         conv = copy.deepcopy(conv_templates[conv_template])
-        conv, videos = put_examples(conv, examples[:2])
-        examples = examples[2:]
+        conv, videos = put_examples(conv, examples[:shot])
+        examples = examples[shot:]
         videos.append(video)
         conv.append_message(conv.roles[0], question)
         conv.append_message(conv.roles[1], None)
         prompt_question = conv.get_prompt()
         input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device)
 
-        cont, confidence = confidence_model.generate(
-            input_ids,
-            images=videos,
-            modalities=["video"]*len(videos),
-            do_sample=False,
-            temperature=0,
-            max_new_tokens=4096,
-        )
-        pred = tokenizer.batch_decode(cont.sequences, skip_special_tokens=True)[0].strip()
-        if confidence > 0.7:
-            max_text_outputs = pred
-            max_confi = confidence
+        with torch.no_grad():
+            cont = model.generate(
+                input_ids,
+                images=videos,
+                modalities=["video"]*len(videos),
+                do_sample=False,
+                temperature=0,
+                max_new_tokens=1024,
+                output_scores=True,
+                return_dict_in_generate=True
+            )
+            del input_ids, videos
+            torch.cuda.empty_cache()
+        generated_tokens = cont.sequences
+        text_outputs = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0].strip()
+        scores = cont.scores 
+        scores = torch.concat(list(scores), dim=0)
+        probs = F.softmax(scores, dim=-1)
+        prob = probs.max(dim=-1).values.min().item()
+        if prob > 0.5:
+            max_text_outputs = text_outputs
+            max_confi = prob
             break
         else:
-            if confidence > max_confi:
-                max_text_outputs = pred
-                max_confi = confidence
+            if prob > max_confi:
+                max_confi = prob
+                max_text_outputs = text_outputs
+        del cont, generated_tokens, scores
+        torch.cuda.empty_cache()
     gold_captions = data['annotation']['English_caption']
 
     references = gold_captions
     candidate = max_text_outputs
 
-    # print(num)
-    # print('pred:', max_text_outputs)
-    # print('gold:', gold_captions[0])
+    print('num', num, 'shot', shot)
+    print('pred:', max_text_outputs)
+    print('gold:', gold_captions[0])
 
     elem = {
         "video_id": data['video_id'],
@@ -134,5 +146,5 @@ for data in tqdm(test_jf):
     }
     history.append(elem)
 
-with open('/home/ubuntu/workspace/datasets/CapERA/test_2shoticl_trainedprobe.json', 'w') as f:
+with open(f'/home/ubuntu/workspace/datasets/CapERA/capera_{shot}shoticl_tokenprob.json', 'w') as f:
     json.dump(history, f)

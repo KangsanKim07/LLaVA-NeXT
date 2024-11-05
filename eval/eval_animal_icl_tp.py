@@ -12,15 +12,13 @@ import warnings
 from decord import VideoReader, cpu
 import numpy as np
 warnings.filterwarnings("ignore")
+import pandas as pd
 from tqdm import tqdm
 import concurrent
 import torch.nn.functional as F
 import time
-import deepspeed
-
 torch.cuda.set_sync_debug_mode(1)
-number_dict = {'none': '0', 'zero': '0', 'one': '1', 'two': '2', 'three': '3', 'four': '4', 'five': '5', 'six': '6', 'seven': '7',
-            'eight': '8', 'nine': '9', 'ten': '10', 'once': '1', 'twice': '2'}
+from llava.confidence.llava_with_confidence import LLavaWithConfidence
 
 def load_video(video_path, max_frames_num,fps=1,force_sample=False):
     if max_frames_num == 0:
@@ -51,8 +49,8 @@ def put_examples(conv, examples):
     video_paths = []
     max_frames_num = 32
     for ex in reversed(examples):
-        conv.append_message(conv.roles[0], DEFAULT_IMAGE_TOKEN + f"\n{ex['question']} Answer in short words or a sentence.")
-        conv.append_message(conv.roles[1], ex['answer'])
+        conv.append_message(conv.roles[0], DEFAULT_IMAGE_TOKEN + f"\n{ex['question']}")
+        conv.append_message(conv.roles[1], f"The answer is ({ex['answer']})")
         video_path = f"/home/ubuntu/workspace/datasets/{ex['video']}"
         video_paths.append(video_path)
 
@@ -67,73 +65,80 @@ device_map = "auto"
 
 tokenizer, model, image_processor, max_length = load_pretrained_model(pretrained, None, model_name, torch_dtype="bfloat16", device_map=device_map)  # Add any other thing you want to pass in llava_model_args
 model.eval()
+confidence_model = LLavaWithConfidence(model)
 
-with open('/home/ubuntu/workspace/datasets/SportsQA/test_sim_all.json', 'r') as f:
-    jf = json.load(f)
-with open('/home/ubuntu/workspace/datasets/SportsQA/meta-data/train_all.json', 'r') as f:
+with open("/home/ubuntu/workspace/datasets/AnimalKingdom/annotation/val_mc.json", "r") as f:
+    df = json.load(f)
+with open('/home/ubuntu/workspace/datasets/AnimalKingdom/video_top500_sim.json', 'r') as f:
+    simrank = json.load(f)
+with open('/home/ubuntu/workspace/datasets/AnimalKingdom/annotation/train_mc.json', 'r') as f:
     train_jf = json.load(f)
-    train_dict = {}
-    for i in train_jf:
-        train_dict[i['qa_id']] = i
+    train_samples = {}
+    for data in train_jf:
+        train_samples[data['video'].split('/')[-1]] = data
 
 acc = []
-for q, data in enumerate(tqdm(jf)):
+pbar = tqdm(total=len(df))
+shot = 2
+for idx, data in enumerate(df):
     video_path = "/home/ubuntu/workspace/datasets/" + data['video']
     max_frames_num = 32
     video,frame_time,video_time = load_video(video_path, max_frames_num, 1, force_sample=False)
     video = image_processor.preprocess(video, return_tensors="pt")["pixel_values"].cuda().bfloat16()
-    conv_template = "qwen_1_5"
-    question = DEFAULT_IMAGE_TOKEN + f"\n{data['question']} Answer in short words or a sentence."
+    conv_template = "qwen_1_5"  # Make sure you use correct chat template for different models
+    question =  DEFAULT_IMAGE_TOKEN + "\n" + data['question']
     max_text_outputs = None
     max_confi = 0
-    candidates = data['train_examples']
+    try:
+        candidates = simrank[data['video'].split('/')[-1]]['train_examples']
+    except:
+        candidates = [None] * 10
     for num in range(4):
-        conv = copy.deepcopy(conv_templates[conv_template])
-        examples = candidates[:2]
-        examples = [train_dict[x['train_question_id']] for x in examples]
-        candidates = candidates[2:]
-        conv, videos = put_examples(conv, examples)
+        try:
+            conv = copy.deepcopy(conv_templates[conv_template])
+            examples = candidates[:shot]
+            examples = [train_samples[x] for x in examples]
+            candidates = candidates[shot:]
+            conv, videos = put_examples(conv, examples)
+        except:
+            conv = copy.deepcopy(conv_templates[conv_template])
+            videos = []
+        videos.append(video)
         conv.append_message(conv.roles[0], question)
         conv.append_message(conv.roles[1], None)
-        prompt_question = conv.get_prompt()
+        prompt_question = conv.get_prompt() + "The answer is ("
         input_ids = tokenizer_image_token(prompt_question, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(device)
-        videos.append(video)
         with torch.no_grad():
-            cont = model.generate(
+            cont, confidence = confidence_model.generate(
                 input_ids,
                 images=videos,
-                modalities= ["video"] * len(videos),
+                modalities=["video"]*len(videos),
                 do_sample=False,
                 temperature=0,
-                max_new_tokens=50,
-                output_scores=True,
-                return_dict_in_generate=True
+                max_new_tokens=3,
             )
-        del input_ids
+        del input_ids, videos
         torch.cuda.empty_cache()
-        generated_tokens = cont.sequences
-        text_outputs = tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0].strip()
-        scores = cont.scores
-        scores = torch.concat(list(scores), dim=0)
-        probs = F.softmax(scores, dim=-1)
-        prob = probs.max(dim=-1).values.min().item()
-        if prob > 0.5:
-            max_text_outputs = text_outputs
-            max_confi = prob
+        pred = tokenizer.batch_decode(cont.sequences, skip_special_tokens=True)[0].strip()
+        if confidence > 0.7:
+            max_text_outputs = pred
+            max_confi = confidence
             break
         else:
-            if prob > max_confi:
-                max_confi = prob
-                max_text_outputs = text_outputs
-    answer = data['answer'].lower()
-    print(max_text_outputs, '///', answer)
+            if confidence > max_confi:
+                max_confi = confidence
+                max_text_outputs = pred
 
-    if answer in max_text_outputs.lower():
+    answer = data['answer']
+
+    if max_text_outputs != "" and answer == max_text_outputs[0]:
         acc.append(1)
     else:
         acc.append(0)
     
-    print('total acc', round(sum(acc)/len(acc), 5), ['Wrong', 'Correct'][acc[-1]], round(max_confi, 3), 'try', num, 'shot', len(videos)-1, 'sportsqa')
-
-    del cont, probs, generated_tokens, scores
+    print('total acc', round(sum(acc)/len(acc), 5), ['Wrong', 'Correct'][acc[-1]], round(max_confi, 3), 'try', num, 'shot', shot)
+    pbar.update(1)
+    del cont, pred
     torch.cuda.empty_cache()
+
+pbar.close()
